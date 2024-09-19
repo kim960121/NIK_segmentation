@@ -5,12 +5,7 @@ import torch
 import habana_frameworks.torch.core as htcore
 from tqdm import tqdm
 
-def process_chunk(chunk, device):
-    # Process a single chunk of data
-    chunk = torch.tensor(chunk, dtype=torch.float32).to(device)
-    return chunk
-
-def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
+def pdn_predefined(n, m, uc_all, map, PDN_name):
     # Initialize Habana device
     htcore.hpu_initialize()
     device = torch.device("hpu")
@@ -21,35 +16,31 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
     new_map = []
     total_port = 0
 
-    # Process uc_all in chunks
-    uc_all_processed = []
-    for uc in tqdm(uc_all, desc="Processing unit cells"):
-        chunks = [uc[i:i+chunk_size] for i in range(0, uc.shape[0], chunk_size)]
-        processed_chunks = [process_chunk(chunk, device) for chunk in chunks]
-        uc_all_processed.append(torch.cat(processed_chunks, dim=0))
+    # Convert uc_all to PyTorch tensors and move to Gaudi
+    uc_all = [torch.tensor(uc, dtype=torch.float32).to(device) for uc in uc_all]
 
-    for k in tqdm(range(n), desc="Processing rows"):
+    for k in tqdm(range(n)):
         port_num = 0
-        #print(map[k, :])
-        for i in tqdm(range(m), desc="Processing columns"):
+        print(map[k, :])
+        for i in tqdm(range(m)):
             num = int(map[k][i])
             if i % m == 0:
                 if num in s5p:
-                    merged_z = uc_all_processed[num - 1]
+                    merged_z = uc_all[num - 1]
                     new_map.append(num)
                     current_port = 1
                     port_num += 1
                 else:
-                    merged_z = uc_all_processed[num - 1]
+                    merged_z = uc_all[num - 1]
                     current_port = 0
                     port_num = 0
             else:
                 if num in s5p:
-                    uc = uc_all_processed[num - 1]
+                    uc = uc_all[num - 1]
                     new_map.append(num)
                     current_port = 1
                 else:
-                    uc = uc_all_processed[num - 1]
+                    uc = uc_all[num - 1]
                     current_port = 0
 
                 i = i - 1
@@ -68,18 +59,14 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
                 zqb = uc[:, 0:1, 1:]
                 zbq = uc[:, 1:, 0:1]
 
-                # Compute merged z in chunks
-                Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-                for start in range(0, zaa.shape[0], chunk_size):
-                    end = start + chunk_size
-                    Z_AA_temp = torch.matmul(zap[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                    Z_AA.append(zaa[start:end] - torch.matmul(Z_AA_temp, zpa[start:end]))
-                    Z_AB.append(torch.matmul(Z_AA_temp, zqb[start:end]))
-                    Z_BB_temp = torch.matmul(zbq[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                    Z_BB.append(zbb[start:end] - torch.matmul(Z_BB_temp, zqb[start:end]))
-                    Z_BA.append(torch.matmul(Z_BB_temp, zpa[start:end]))
+                # Compute merged z
+                Z_AA_temp = torch.matmul(zap, torch.inverse(zpp + zqq))
+                Z_AA = zaa - torch.matmul(Z_AA_temp, zpa)
+                Z_AB = torch.matmul(Z_AA_temp, zqb)
+                Z_BB_temp = torch.matmul(zbq, torch.inverse(zpp + zqq))
+                Z_BB = zbb - torch.matmul(Z_BB_temp, zqb)
+                Z_BA = torch.matmul(Z_BB_temp, zpa)
 
-                Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
                 Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
 
                 # Re-arrange Port numbering
@@ -125,18 +112,12 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
             zbq = torch.cat([lo_2, lo_8], dim=1)
             zqb = torch.cat([lo_4, lo_6], dim=2)
 
-            # Compute merged z in chunks
-            Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-            for start in range(0, zaa.shape[0], chunk_size):
-                end = start + chunk_size
-                Z_AA_temp = torch.matmul(zap[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                Z_AA.append(zaa[start:end] - torch.matmul(Z_AA_temp, zpa[start:end]))
-                Z_AB.append(torch.matmul(Z_AA_temp, zqb[start:end]))
-                Z_BB_temp = torch.matmul(zbq[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                Z_BB.append(zbb[start:end] - torch.matmul(Z_BB_temp, zqb[start:end]))
-                Z_BA.append(torch.matmul(Z_BB_temp, zpa[start:end]))
-
-            Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
+            Z_AA_temp = torch.matmul(zap, torch.inverse(zpp + zqq))
+            Z_AA = zaa - torch.matmul(Z_AA_temp, zpa)
+            Z_AB = torch.matmul(Z_AA_temp, zqb)
+            Z_BB_temp = torch.matmul(zbq, torch.inverse(zpp + zqq))
+            Z_BB = zbb - torch.matmul(Z_BB_temp, zqb)
+            Z_BA = torch.matmul(Z_BB_temp, zpa)
             Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
 
             Z_1, Z_2, Z_3 = Z_temp[:, :total_port, :total_port], Z_temp[:, :total_port, total_port:total_port+m], Z_temp[:, :total_port, total_port+m:total_port+m+port_num]
@@ -171,6 +152,7 @@ if __name__ == "__main__":
 
     np.save(f'final_model/{int_N}_by_{int_M}_PDN_{PDN_name}.npy', PDN)
     np.save(f'final_model/final_map_{PDN_name}.npy', new_map)
+
 
 # Finalize Habana device
 htcore.hpu_finalize()
