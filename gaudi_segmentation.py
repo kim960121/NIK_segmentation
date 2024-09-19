@@ -1,7 +1,4 @@
 import numpy as np
-import csv
-import pandas as pd
-import matplotlib.pyplot as plt
 import skrf as rf
 from skrf import Network, Frequency
 import torch
