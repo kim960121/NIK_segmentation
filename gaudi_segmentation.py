@@ -7,9 +7,9 @@ from tqdm import tqdm
 
 def pdn_predefined(n, m, uc_all, map, PDN_name):
     # Initialize Habana device
-    htcore.initialize()
+    htcore.hpu_initialize()
     device = torch.device("hpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device}")    
 
     num_uc = len(uc_all)
     s5p = [i + 1 for i, uc in enumerate(uc_all) if uc.shape[1] == 5]
@@ -155,4 +155,4 @@ if __name__ == "__main__":
 
 
 # Finalize Habana device
-htcore.finalize()
+htcore.hpu_finalize()
