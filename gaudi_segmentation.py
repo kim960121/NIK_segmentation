@@ -6,25 +6,25 @@ import habana_frameworks.torch.core as htcore
 from tqdm import tqdm
 
 def process_chunk(chunk, device):
-    chunk = torch.tensor(chunk, dtype=torch.float32).to(device)
-    return chunk
+    return torch.tensor(chunk, dtype=torch.float32).to(device)
 
 def compute_merged_z(zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb, device):
-    zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb = [tensor.to(device) for tensor in [zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb]]
-    
-    Z_AA_temp = torch.matmul(zap, torch.inverse(zpp + zqq))
-    Z_AA = zaa - torch.matmul(Z_AA_temp, zpa)
-    Z_AB = torch.matmul(Z_AA_temp, zqb)
-    Z_BB_temp = torch.matmul(zbq, torch.inverse(zpp + zqq))
-    Z_BB = zbb - torch.matmul(Z_BB_temp, zqb)
-    Z_BA = torch.matmul(Z_BB_temp, zpa)
-    
-    return Z_AA.cpu(), Z_AB.cpu(), Z_BB.cpu(), Z_BA.cpu()
+    with torch.no_grad():
+        Z_AA_temp = torch.matmul(zap, torch.inverse(zpp + zqq))
+        Z_AA = zaa - torch.matmul(Z_AA_temp, zpa)
+        Z_AB = torch.matmul(Z_AA_temp, zqb)
+        Z_BB_temp = torch.matmul(zbq, torch.inverse(zpp + zqq))
+        Z_BB = zbb - torch.matmul(Z_BB_temp, zqb)
+        Z_BA = torch.matmul(Z_BB_temp, zpa)
+    return Z_AA, Z_AB, Z_BB, Z_BA
 
 def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
     htcore.hpu_initialize()
     num_gpus = torch.hpu.device_count()
     print(f"Using {num_gpus} Gaudi GPUs")
+
+    devices = [torch.device(f"hpu:{i}") for i in range(num_gpus)]
+    current_device = 0
 
     num_uc = len(uc_all)
     s5p = [i + 1 for i, uc in enumerate(uc_all) if uc.shape[1] == 5]
@@ -34,7 +34,7 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
     uc_all_processed = []
     for uc in tqdm(uc_all, desc="Processing unit cells"):
         chunks = [uc[i:i+chunk_size] for i in range(0, uc.shape[0], chunk_size)]
-        processed_chunks = [process_chunk(chunk, f"hpu:{i % num_gpus}") for i, chunk in enumerate(chunks)]
+        processed_chunks = [process_chunk(chunk, devices[i % num_gpus]) for i, chunk in enumerate(chunks)]
         uc_all_processed.append(torch.cat(processed_chunks, dim=0))
 
     for k in tqdm(range(n), desc="Processing rows"):
@@ -75,22 +75,24 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
                 zqb = uc[:, 0:1, 1:]
                 zbq = uc[:, 1:, 0:1]
 
-                # Distribute computation across GPUs sequentially
+                # Distribute computation across GPUs
                 Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-                for gpu_id in range(num_gpus):
-                    start = gpu_id * (zaa.shape[0] // num_gpus)
-                    end = (gpu_id + 1) * (zaa.shape[0] // num_gpus) if gpu_id < num_gpus - 1 else zaa.shape[0]
-                    device = f"hpu:{gpu_id}"
-                    
+                for start in range(0, zaa.shape[0], chunk_size):
+                    end = min(start + chunk_size, zaa.shape[0])
+                    device = devices[current_device]
+                    current_device = (current_device + 1) % num_gpus
+
                     z_aa, z_ab, z_bb, z_ba = compute_merged_z(
-                        zap[start:end], zpa[start:end], zpp[start:end], zqq[start:end],
-                        zbq[start:end], zqb[start:end], zaa[start:end], zbb[start:end],
+                        zap[start:end].to(device), zpa[start:end].to(device),
+                        zpp[start:end].to(device), zqq[start:end].to(device),
+                        zbq[start:end].to(device), zqb[start:end].to(device),
+                        zaa[start:end].to(device), zbb[start:end].to(device),
                         device
                     )
-                    Z_AA.append(z_aa)
-                    Z_AB.append(z_ab)
-                    Z_BB.append(z_bb)
-                    Z_BA.append(z_ba)
+                    Z_AA.append(z_aa.cpu())
+                    Z_AB.append(z_ab.cpu())
+                    Z_BB.append(z_bb.cpu())
+                    Z_BA.append(z_ba.cpu())
 
                 Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
                 Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
@@ -137,22 +139,24 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
             zbq = torch.cat([lo_2, lo_8], dim=1)
             zqb = torch.cat([lo_4, lo_6], dim=2)
 
-            # Distribute computation across GPUs sequentially
+            # Distribute computation across GPUs
             Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-            for gpu_id in range(num_gpus):
-                start = gpu_id * (zaa.shape[0] // num_gpus)
-                end = (gpu_id + 1) * (zaa.shape[0] // num_gpus) if gpu_id < num_gpus - 1 else zaa.shape[0]
-                device = f"hpu:{gpu_id}"
-                
+            for start in range(0, zaa.shape[0], chunk_size):
+                end = min(start + chunk_size, zaa.shape[0])
+                device = devices[current_device]
+                current_device = (current_device + 1) % num_gpus
+
                 z_aa, z_ab, z_bb, z_ba = compute_merged_z(
-                    zap[start:end], zpa[start:end], zpp[start:end], zqq[start:end],
-                    zbq[start:end], zqb[start:end], zaa[start:end], zbb[start:end],
+                    zap[start:end].to(device), zpa[start:end].to(device),
+                    zpp[start:end].to(device), zqq[start:end].to(device),
+                    zbq[start:end].to(device), zqb[start:end].to(device),
+                    zaa[start:end].to(device), zbb[start:end].to(device),
                     device
                 )
-                Z_AA.append(z_aa)
-                Z_AB.append(z_ab)
-                Z_BB.append(z_bb)
-                Z_BA.append(z_ba)
+                Z_AA.append(z_aa.cpu())
+                Z_AB.append(z_ab.cpu())
+                Z_BB.append(z_bb.cpu())
+                Z_BA.append(z_ba.cpu())
 
             Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
             Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
@@ -171,7 +175,7 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
     print("PDN shape", PDN.shape)
     print("new map", new_map)
 
-    return PDN.cpu().numpy(), new_map
+    return PDN.numpy(), new_map
 
 if __name__ == "__main__":
     PDN_name = 'gaudi'
