@@ -22,6 +22,7 @@ int_M=1000  #가로 unit cell 개수
 # 활용하고자 하는 모든 unit cell snp 파일 불러오기 및 numpy로 변환
 snp1=rf.Network('data/S_para/240919_11um_UC.s5p')
 uc1=rf.network.s2z(snp1._s, z0=50)
+
 """
 snp1=rf.Network('data/S_para/ex1.s4p')
 uc1=rf.network.s2z(snp1._s, z0=50)
