@@ -4,28 +4,38 @@ from skrf import Network, Frequency
 import torch
 import habana_frameworks.torch.core as htcore
 from tqdm import tqdm
+import torch.multiprocessing as mp
 
 def process_chunk(chunk, device):
-    # Process a single chunk of data
     chunk = torch.tensor(chunk, dtype=torch.float32).to(device)
     return chunk
 
+def compute_merged_z(zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb, device):
+    zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb = [tensor.to(device) for tensor in [zap, zpa, zpp, zqq, zbq, zqb, zaa, zbb]]
+    
+    Z_AA_temp = torch.matmul(zap, torch.inverse(zpp + zqq))
+    Z_AA = zaa - torch.matmul(Z_AA_temp, zpa)
+    Z_AB = torch.matmul(Z_AA_temp, zqb)
+    Z_BB_temp = torch.matmul(zbq, torch.inverse(zpp + zqq))
+    Z_BB = zbb - torch.matmul(Z_BB_temp, zqb)
+    Z_BA = torch.matmul(Z_BB_temp, zpa)
+    
+    return Z_AA.cpu(), Z_AB.cpu(), Z_BB.cpu(), Z_BA.cpu()
+
 def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
-    # Initialize Habana device
     htcore.hpu_initialize()
-    device = torch.device("hpu")
-    print(f"Using device: {device}")    
+    num_gpus = torch.hpu.device_count()
+    print(f"Using {num_gpus} Gaudi GPUs")
 
     num_uc = len(uc_all)
     s5p = [i + 1 for i, uc in enumerate(uc_all) if uc.shape[1] == 5]
     new_map = []
     total_port = 0
 
-    # Process uc_all in chunks
     uc_all_processed = []
     for uc in tqdm(uc_all, desc="Processing unit cells"):
         chunks = [uc[i:i+chunk_size] for i in range(0, uc.shape[0], chunk_size)]
-        processed_chunks = [process_chunk(chunk, device) for chunk in chunks]
+        processed_chunks = [process_chunk(chunk, f"hpu:{i % num_gpus}") for i, chunk in enumerate(chunks)]
         uc_all_processed.append(torch.cat(processed_chunks, dim=0))
 
     for k in tqdm(range(n), desc="Processing rows"):
@@ -53,12 +63,10 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
                     current_port = 0
 
                 i = i - 1
-                # Segment the merged_z tensor
                 seg1, seg2, seg3 = merged_z[:, :i+2, :i+2], merged_z[:, :i+2, i+2:i+3], merged_z[:, :i+2, i+3:]
                 seg4, seg5, seg6 = merged_z[:, i+2:i+3, :i+2], merged_z[:, i+2:i+3, i+2:i+3], merged_z[:, i+2:i+3, i+3:]
                 seg7, seg8, seg9 = merged_z[:, i+3:, :i+2], merged_z[:, i+3:, i+2:i+3], merged_z[:, i+3:, i+3:]
 
-                # Concatenate segments
                 zaa = torch.cat([torch.cat([seg1, seg3], dim=2), torch.cat([seg7, seg9], dim=2)], dim=1)
                 zbb = uc[:, 1:, 1:]
                 zpp = seg5
@@ -68,21 +76,23 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
                 zqb = uc[:, 0:1, 1:]
                 zbq = uc[:, 1:, 0:1]
 
-                # Compute merged z in chunks
-                Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-                for start in range(0, zaa.shape[0], chunk_size):
-                    end = start + chunk_size
-                    Z_AA_temp = torch.matmul(zap[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                    Z_AA.append(zaa[start:end] - torch.matmul(Z_AA_temp, zpa[start:end]))
-                    Z_AB.append(torch.matmul(Z_AA_temp, zqb[start:end]))
-                    Z_BB_temp = torch.matmul(zbq[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                    Z_BB.append(zbb[start:end] - torch.matmul(Z_BB_temp, zqb[start:end]))
-                    Z_BA.append(torch.matmul(Z_BB_temp, zpa[start:end]))
+                # Distribute computation across GPUs
+                chunk_sizes = [len(range(0, zaa.shape[0], chunk_size)) // num_gpus + (1 if i < len(range(0, zaa.shape[0], chunk_size)) % num_gpus else 0) for i in range(num_gpus)]
+                start_indices = [sum(chunk_sizes[:i]) * chunk_size for i in range(num_gpus)]
+                end_indices = [sum(chunk_sizes[:i+1]) * chunk_size for i in range(num_gpus)]
+                end_indices[-1] = zaa.shape[0]  # Ensure the last chunk covers all remaining data
 
-                Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
+                with mp.Pool(num_gpus) as pool:
+                    results = pool.starmap(compute_merged_z, [
+                        (zap[start:end], zpa[start:end], zpp[start:end], zqq[start:end],
+                         zbq[start:end], zqb[start:end], zaa[start:end], zbb[start:end],
+                         f"hpu:{i}")
+                        for i, (start, end) in enumerate(zip(start_indices, end_indices))
+                    ])
+
+                Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat([r[i] for r in results], dim=0) for i in range(4)]
                 Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
 
-                # Re-arrange Port numbering
                 a, b, c, d = i+2, 2*i+3+port_num, 2*i+6+port_num, 2*i+7+port_num
                 m1, m2, m3, m4 = Z_temp[:, :a, :a], Z_temp[:, :a, a:b], Z_temp[:, :a, b:c], Z_temp[:, :a, c:d]
                 m5, m6, m7, m8 = Z_temp[:, a:b, :a], Z_temp[:, a:b, a:b], Z_temp[:, a:b, b:c], Z_temp[:, a:b, c:d]
@@ -125,18 +135,21 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
             zbq = torch.cat([lo_2, lo_8], dim=1)
             zqb = torch.cat([lo_4, lo_6], dim=2)
 
-            # Compute merged z in chunks
-            Z_AA, Z_AB, Z_BB, Z_BA = [], [], [], []
-            for start in range(0, zaa.shape[0], chunk_size):
-                end = start + chunk_size
-                Z_AA_temp = torch.matmul(zap[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                Z_AA.append(zaa[start:end] - torch.matmul(Z_AA_temp, zpa[start:end]))
-                Z_AB.append(torch.matmul(Z_AA_temp, zqb[start:end]))
-                Z_BB_temp = torch.matmul(zbq[start:end], torch.inverse(zpp[start:end] + zqq[start:end]))
-                Z_BB.append(zbb[start:end] - torch.matmul(Z_BB_temp, zqb[start:end]))
-                Z_BA.append(torch.matmul(Z_BB_temp, zpa[start:end]))
+            # Distribute computation across GPUs
+            chunk_sizes = [len(range(0, zaa.shape[0], chunk_size)) // num_gpus + (1 if i < len(range(0, zaa.shape[0], chunk_size)) % num_gpus else 0) for i in range(num_gpus)]
+            start_indices = [sum(chunk_sizes[:i]) * chunk_size for i in range(num_gpus)]
+            end_indices = [sum(chunk_sizes[:i+1]) * chunk_size for i in range(num_gpus)]
+            end_indices[-1] = zaa.shape[0]  # Ensure the last chunk covers all remaining data
 
-            Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat(z, dim=0) for z in (Z_AA, Z_AB, Z_BB, Z_BA)]
+            with mp.Pool(num_gpus) as pool:
+                results = pool.starmap(compute_merged_z, [
+                    (zap[start:end], zpa[start:end], zpp[start:end], zqq[start:end],
+                     zbq[start:end], zqb[start:end], zaa[start:end], zbb[start:end],
+                     f"hpu:{i}")
+                    for i, (start, end) in enumerate(zip(start_indices, end_indices))
+                ])
+
+            Z_AA, Z_AB, Z_BB, Z_BA = [torch.cat([r[i] for r in results], dim=0) for i in range(4)]
             Z_temp = torch.cat([torch.cat([Z_AA, Z_AB], dim=2), torch.cat([Z_BA, Z_BB], dim=2)], dim=1)
 
             Z_1, Z_2, Z_3 = Z_temp[:, :total_port, :total_port], Z_temp[:, :total_port, total_port:total_port+m], Z_temp[:, :total_port, total_port+m:total_port+m+port_num]
@@ -153,10 +166,8 @@ def pdn_predefined(n, m, uc_all, map, PDN_name, chunk_size=100):
     print("PDN shape", PDN.shape)
     print("new map", new_map)
 
-    # Move the result back to CPU for NumPy compatibility
-    return PDN.cpu().numpy(), new_map
+    return PDN.numpy(), new_map
 
-# Main execution
 if __name__ == "__main__":
     PDN_name = 'gaudi'
     int_N, int_M = 1000, 1000
@@ -172,5 +183,4 @@ if __name__ == "__main__":
     np.save(f'final_model/{int_N}_by_{int_M}_PDN_{PDN_name}.npy', PDN)
     np.save(f'final_model/final_map_{PDN_name}.npy', new_map)
 
-# Finalize Habana device
 htcore.hpu_finalize()
